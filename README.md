@@ -21,8 +21,7 @@ A production-ready backend system for collaborative task management, built with 
 13. [Future Improvements](#13-future-improvements)
 14. [How to Run the Project](#14-how-to-run-the-project)
 15. [Environment Variables](#15-environment-variables)
-16. [Example Requests & Responses](#16-example-requests--responses)
-17. [Developer Notes](#17-developer-notes)
+16. [Developer Notes](#16-developer-notes)
 
 ---
 
