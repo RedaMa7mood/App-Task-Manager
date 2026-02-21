@@ -51,44 +51,105 @@ This is a **full-featured real-time task management backend API** designed for t
 
 The project follows a **layered architecture** that separates concerns clearly, making it testable and maintainable:
 
-```
-Client (HTTP + WebSocket)
-        │
-        ▼
-  [ Express App (index.ts) ]
-        │
-  ┌─────────────────────────┐
-  │     Middleware Layer     │
-  │  Rate Limiting, HPP,    │
-  │  Cookie Parser, GZIP    │
-  └───────────┬─────────────┘
-              │
-  ┌─────────────────────────┐
-  │      Router Layer        │
-  │  /api/v1/users           │
-  │  /api/v1/projects        │
-  │  /api/v1/tasks           │
-  └───────────┬─────────────┘
-              │
-  ┌─────────────────────────┐
-  │    Controller Layer      │  ← Request validation + orchestration
-  └───────────┬─────────────┘
-              │
-  ┌─────────────────────────┐
-  │     Service Layer        │  ← Business logic + Prisma queries
-  └───────────┬─────────────┘
-              │
-  ┌─────────────────────────┐
-  │   Prisma ORM + PostgreSQL│  ← Data persistence
-  └─────────────────────────┘
+### High-Level Architecture
 
-  [Socket.io Server] ← runs alongside HTTP server on same port
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        CLIENT LAYER                             │
+│              Browser / Mobile App / API Consumer                │
+│                  HTTP Requests + WebSocket                      │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+            ┌──────────────┴──────────────┐
+            │ HTTP (REST)                 │ WebSocket (ws://)
+            ▼                             ▼
+┌───────────────────────┐   ┌─────────────────────────────────────┐
+│   Express App         │   │         Socket.io Server            │
+│   (index.ts)          │   │         (server.ts → socket.ts)     │
+│                       │   │                                     │
+│  ┌─────────────────┐  │   │  io.on('connection', socket => {   │
+│  │ Middleware Stack │  │   │    registerTaskSocket(io, socket)  │
+│  │─────────────────│  │   │  })                                 │
+│  │ hpp()           │  │   │                                     │
+│  │ json({20kb})    │  │   │  Rooms:                             │
+│  │ cookieParser()  │  │   │   ● project-{id}   (task events)   │
+│  │ compression()   │  │   │   ● task-{id}      (task detail)   │
+│  │ rateLimit()     │  │   │                                     │
+│  └────────┬────────┘  │   └──────────────────┬──────────────────┘
+│           │           │                      │
+│  ┌────────▼────────┐  │        emit() ◄───────┘
+│  │  Router Layer   │  │           │
+│  │─────────────────│  │           │  (Controllers call getIO()
+│  │ /api/v1/users   │  │           │   to broadcast on mutation)
+│  │ /api/v1/projects│  │           │
+│  │ /api/v1/tasks   │  │           │
+│  └────────┬────────┘  │           │
+└───────────┼───────────┘           │
+            │                       │
+            ▼                       │
+┌───────────────────────────────────┴───────────────────────────┐
+│                     CONTROLLER LAYER                          │
+│  Validates input (Zod/params) · Calls service · Emits to WS  │
+│  Wrapped in CatchAsync() → errors forwarded to globalError    │
+└───────────────────────────────────────────────────────────────┘
+            │
+            ▼
+┌───────────────────────────────────────────────────────────────┐
+│                      SERVICE LAYER                            │
+│  Pure business logic · All Prisma queries live here           │
+│  Returns typed results · No knowledge of req/res              │
+└───────────────────────────────────────────────────────────────┘
+            │
+            ▼
+┌───────────────────────────────────────────────────────────────┐
+│              PRISMA ORM  +  POSTGRESQL (Neon)                 │
+│  Type-safe queries · Auto migrations · Relational integrity   │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### Request Lifecycle (per API call)
+
+```
+Incoming Request
+      │
+      ▼
+  hpp()  →  json()  →  cookieParser()  →  compression()  →  rateLimit()
+      │
+      ▼
+  Router matches URL pattern
+      │
+      ├── Auth middleware? (protect) → verify JWT → attach req.user
+      │
+      ├── Role middleware? (authorize) → check req.user.role
+      │
+      ▼
+  Controller function (CatchAsync wrapped)
+      │
+      ├── Validate params (Zod / isNaN checks)
+      ├── Call service function  ─────────────────► Prisma query
+      ├── getIO().to(room).emit(event, data)         (if mutation)
+      └── res.status(xxx).json({...})
+              │
+              ▼
+       Response to client
+              │
+              │  (on any thrown error)
+              ▼
+       globalError middleware
+         ├── ZodError        → 400
+         ├── JsonWebTokenError → 401
+         ├── TokenExpiredError → 401
+         ├── P2025 (Prisma)  → 404
+         └── other           → 500
+              │
+              ▼
+        Winston logger  →  logs/error.log
 ```
 
 **Why this architecture?**
 - **Controllers** validate input and coordinate — they don't contain business rules.
 - **Services** own the database logic — they can be unit-tested independently.
-- **routers** are thin, serving only to wire URL patterns to controller functions.
+- **Routers** are thin, serving only to wire URL patterns to controller functions.
 - This separation means any layer can be swapped (e.g., replacing Prisma with a different ORM) without touching the controllers.
 
 ---
@@ -97,26 +158,84 @@ Client (HTTP + WebSocket)
 
 The PostgreSQL database consists of **8 tables** that model the full domain:
 
-```
-┌──────────┐         ┌─────────────────┐         ┌──────────┐
-│   User   │─────────│  Project_Member  │─────────│ Project  │
-│          │  M   M  │  (junction)      │  M   1  │          │
-└────┬─────┘         └─────────────────┘         └────┬─────┘
-     │ 1                                               │ 1
-     │                                                 │
-     │ M                                               │ M
-┌────┴─────┐         ┌──────────┐       ┌──────────┐  │
-│   Task   │─────────│ Task_Tags│───────│   Tags   │  │
-│          │  M   M  │(junction)│  M  1 │          │  │
-└────┬─────┘         └──────────┘       └──────────┘  │
-     │ 1                                               │
-     │ M                                               │
-┌────┴─────┐   ┌────────────────┐
-│ comments │   │  RefreshToken  │
-│          │   │                │
-└──────────┘   └────────────────┘
+### Entity Relationship Diagram
 
-Task.parentTaskId → Task.id  (self-referential, for subtasks)
+```
+                      ┌───────────────────────────────────┐
+                      │              User                 │
+                      │───────────────────────────────────│
+                      │ PK  id           Int              │
+                      │     name         String           │
+                      │     email        String  UNIQUE   │
+                      │     password     String (hashed)  │
+                      │     role         UserRole         │
+                      │     createdAt    DateTime         │
+                      └──────┬──────────────┬─────────────┘
+               ┌─────────────┘              │
+          1 owns M                     1 has M
+               │                            │
+               ▼                            ▼
+  ┌────────────────────┐       ┌─────────────────────────┐
+  │      Project       │       │      RefreshToken        │
+  │────────────────────│       │─────────────────────────│
+  │ PK id    Int       │       │ PK id        Int         │
+  │    title  String   │       │    token     String UNQ  │
+  │    desc   String?  │       │    userId    Int (FK)    │
+  │    ownerId Int(FK) │       │    expiresAt DateTime    │
+  │    createdAt       │       │    revoked   Boolean     │
+  │    updatedAt       │       └─────────────────────────┘
+  └────────┬───────────┘
+      1 has M              M belongs to M (via junction)
+       │          ┌──────────────────────────────────────┐
+       │          │         Project_Member               │
+       │          │──────────────────────────────────────│
+       └─────────►│ PK (projectId, userId)               │
+  M belongs to M  │     role      String                 │
+  User ──────────►│     joinedAt  DateTime               │
+                  └──────────────────────────────────────┘
+
+  ┌───────────────────────────────────────────────────────────┐
+  │                         Task                              │
+  │───────────────────────────────────────────────────────────│
+  │ PK  id            Int                                     │
+  │     title         String                                  │
+  │     description   String?                                 │
+  │     status        TaskStatus  (PENDING|IN_PROGRESS|DONE)  │
+  │ FK  projectId     Int  ──────────────────────► Project    │
+  │ FK  createdBy     Int  ──────────────────────► User       │
+  │ FK  assigneeId    Int?  ─────────────────────► User       │
+  │ FK  parentTaskId  Int?  ─────────────────────► Task (self)│
+  │     createdAt     DateTime                                │
+  │     updatedAt     DateTime                                │
+  └──────────────┬────────────────────────────────────────────┘
+                 │                         │
+            1 has M                   M has M (via junction)
+                 │                         │
+                 ▼                         ▼
+  ┌────────────────────┐     ┌──────────────────────────────┐
+  │      comments      │     │         Task_Tags            │
+  │────────────────────│     │──────────────────────────────│
+  │ PK id   Int        │     │ PK (taskId, tagId)           │
+  │ FK taskId  Int     │     │ FK taskId  Int ──────► Task  │
+  │ FK userId  Int     │     │ FK tagId   Int ──────► Tags  │
+  │    content String  │     └──────────────────────────────┘
+  │    isEdited Bool   │                   │
+  │    createdAt       │              M belongs to 1
+  │    updatedAt       │                   │
+  └────────────────────┘                   ▼
+                              ┌────────────────────────────┐
+                              │           Tags             │
+                              │────────────────────────────│
+                              │ PK id     Int              │
+                              │    name   String  UNIQUE   │
+                              │    color  String           │
+                              │    createdAt               │
+                              └────────────────────────────┘
+
+  Self-referential (Subtasks):
+  Task ──── parentTaskId ────► Task
+  (parentTaskId = null  → top-level task)
+  (parentTaskId = X     → subtask of task X)
 ```
 
 ### Key Relationships
@@ -202,28 +321,60 @@ The system uses a **dual-token strategy** with short-lived access tokens and lon
 ### Flow Diagram
 
 ```
- ┌────────┐                              ┌────────────┐           ┌────────┐
- │ Client │                              │ Auth Server│           │   DB   │
- └───┬────┘                              └─────┬──────┘           └───┬────┘
-     │                                         │                      │
-     │── POST /api/v1/users/signup ────────────▶│                      │
-     │                                         │── INSERT user ───────▶│
-     │                                         │── INSERT refreshToken▶│
-     │◀── 201 + Authorization: Bearer {AT} ───│                      │
-     │    Set-Cookie: refreshToken={RT}        │                      │
-     │                                         │                      │
-     │── GET /api/v1/projects [AT expires] ───▶│                      │
-     │◀── 401 Unauthorized ───────────────────│                      │
-     │                                         │                      │
-     │── POST /api/v1/users/refreshtoken ─────▶│                      │
-     │   Cookie: refreshToken={RT}             │── find RT in DB ────▶│
-     │                                         │── revoke old RT ────▶│
-     │                                         │── create new RT ────▶│
-     │◀── 200 + new AT + new RT (rotation) ───│                      │
-     │                                         │                      │
-     │── POST /api/v1/users/logout ───────────▶│                      │
-     │   Cookie: refreshToken={RT}             │── revoke RT ────────▶│
-     │◀── 200 + clearCookie ──────────────────│                      │
+ ┌──────────────┐           ┌───────────────────────┐         ┌──────────┐
+ │    Client    │           │   Express API Server   │         │  PostgreSQL  │
+ └──────┬───────┘           └───────────┬───────────┘         └─────┬────┘
+        │                               │                           │
+        │  ══════════════ SIGN UP ════════════════════════════════  │
+        │                               │                           │
+        │─── POST /api/v1/users/signup ─►│                           │
+        │    { name, email, password }  │── bcrypt.hash(password) ──│
+        │                               │── prisma.user.create() ──►│
+        │                               │── jwt.sign(accessToken)   │
+        │                               │── jwt.sign(refreshToken)  │
+        │                               │── prisma.refreshToken      │
+        │                               │       .create() ─────────►│
+        │◄── 201 Created ───────────────│                           │
+        │    Authorization: Bearer {AT} │                           │
+        │    Set-Cookie: refreshToken   │ (httpOnly, secure, 30d)   │
+        │                               │                           │
+        │  ═══════════════ USE API ════════════════════════════════ │
+        │                               │                           │
+        │─── GET /api/v1/projects ──────►│                           │
+        │    Authorization: Bearer {AT} │── jwt.verify(AT) ─────────│
+        │                               │── prisma.user.findUnique()►│
+        │◄── 200 OK + data ─────────────│                           │
+        │                               │                           │
+        │  ══════════════ TOKEN EXPIRED ═══════════════════════════ │
+        │                               │                           │
+        │─── GET /api/v1/projects ──────►│                           │
+        │    Authorization: Bearer {AT} │── jwt.verify() ← EXPIRED  │
+        │◄── 401 Unauthorized ──────────│                           │
+        │                               │                           │
+        │  ═══════════════ REFRESH TOKEN (rotation) ═══════════════ │
+        │                               │                           │
+        │─── POST /users/refreshtoken ──►│                           │
+        │    Cookie: refreshToken={RT}  │── prisma.refreshToken      │
+        │                               │       .findUnique({RT}) ──►│
+        │                               │── check: revoked? ─────────│
+        │                               │── prisma.refreshToken      │
+        │                               │       .update(revoked=true)►│  ← old RT killed
+        │                               │── jwt.verify(RT) ──────────│
+        │                               │── jwt.sign(new AT)         │
+        │                               │── jwt.sign(new RT)         │
+        │                               │── prisma.refreshToken      │
+        │                               │       .create(new RT) ────►│  ← new RT stored
+        │◄── 200 OK ────────────────────│                           │
+        │    Authorization: Bearer {newAT}                          │
+        │    Set-Cookie: refreshToken={newRT}                       │
+        │                               │                           │
+        │  ═══════════════ LOGOUT ══════════════════════════════════│
+        │                               │                           │
+        │─── POST /users/logout ─────────►│                           │
+        │    Cookie: refreshToken={RT}  │── prisma.refreshToken      │
+        │                               │       .update(revoked=true)►│
+        │◄── 200 OK ────────────────────│                           │
+        │    clearCookie: refreshToken  │                           │
 ```
 
 ### Token Specifications
@@ -252,6 +403,53 @@ const cookieOptions = {
 Base URL: `http://localhost:3000/api/v1`
 
 All endpoints under `/api` are rate-limited to **5 requests per 15 minutes** per IP.
+
+### Route Tree
+
+```
+/api/v1
+│
+├── /users
+│   ├── POST /signup                          → Register user
+│   ├── POST /login                           → Login + get tokens
+│   ├── POST /refreshtoken                    → Rotate refresh token
+│   └── POST /logout                          → Revoke refresh token
+│
+├── /projects
+│   ├── GET    /user/:ownerId                 → Get my projects
+│   ├── POST   /user/:ownerId                 → Create a project
+│   ├── PUT    /user/:projectId               → Update project
+│   ├── DELETE /user/:projectId               → Delete project
+│   │
+│   ├── /:projectId/members
+│   │   ├── GET    /                          → List all members
+│   │   ├── POST   /:memberId                 → Add member
+│   │   ├── PATCH  /:memberId                 → Change role
+│   │   └── DELETE /:memberId                 → Remove member
+│   │
+│   └── /:projectId/tasks
+│       ├── GET    /                          → List tasks (with filters)
+│       ├── POST   /                          → Create task (→ WS: taskCreated)
+│       ├── GET    /:taskId                   → Get single task
+│       ├── PATCH  /:taskId                   → Update task (→ WS: taskUpdated)
+│       ├── DELETE /:taskId                   → Delete task (→ WS: taskDeleted)
+│       │
+│       ├── /:taskId/comments
+│       │   ├── GET    /:commentId            → Get comment
+│       │   ├── POST   /:commentId            → Add comment
+│       │   ├── PUT    /:commentId            → Edit comment
+│       │   └── DELETE /:commentId            → Delete comment
+│       │
+│       └── /:taskId/tags
+│           ├── GET    /                      → List tags
+│           ├── POST   /                      → Create tag
+│           ├── POST   /:tagId               → Attach tag to task
+│           └── DELETE /:tagId               → Detach tag from task
+│
+└── /tasks  (direct shortcut)
+    ├── GET    /:projectId                    → Same as above
+    └── POST   /:projectId                   → Same as above
+```
 
 ### Auth Routes — `/users`
 
@@ -330,27 +528,65 @@ The `GET /tasks` endpoint supports rich query parameters:
 ### Architecture Overview
 
 ```
- HTTP Server (Express)
-        │
-        ▼
- ┌──────────────────────────────────────────┐
- │           Socket.io Server               │
- │                                          │
- │  io.on('connection', (socket) => {       │
- │    registerTaskSocket(io, socket);       │
- │  })                                      │
- └──────────────────────────────────────────┘
-         │
-         ▼
- ┌───────────────────────┐
- │   registerTaskSocket  │  (taskSocket.ts)
- │                       │
- │  Events Handled:      │
- │  - joinProject        │
- │  - leaveProject       │
- │  - joinTask           │
- │  - leaveTask          │
- └───────────────────────┘
+  server.ts
+  ──────────────────────────────────────────────────────────────────
+  const server = app.listen(3000);
+  initSocket(server);                 ← attaches Socket.io to HTTP server
+
+  socket.ts
+  ──────────────────────────────────────────────────────────────────
+  let io: Server;                     ← module-level singleton
+
+  initSocket(server) ─────────────────────────────────────────────┐
+                                                                   │
+       io = new Server(server, { cors: { origin: "*" } })         │
+       io.on('connection', (socket) => {                           │
+           registerTaskSocket(io, socket)                          │
+           socket.on('disconnect', ...)                            │
+       })                                                          │
+       getIO() ← throws if called before initSocket()             │
+                                                                   │
+  taskSocket.ts   (registerTaskSocket)   ◄──────────────────────── ┘
+  ──────────────────────────────────────────────────────────────────
+  socket.on('joinProject',  projectId) → socket.join('project-{id}')
+                                       → socket.to(room).emit('joinedProject', {...})
+
+  socket.on('leaveProject', projectId) → socket.leave('project-{id}')
+                                       → socket.to(room).emit('leftProject', {...})
+
+  socket.on('joinTask',  taskId)       → socket.join('task-{id}')
+                                       → socket.to(room).emit('joinedTask', {...})
+
+  socket.on('leaveTask', taskId)       → socket.leave('task-{id}')
+                                       → socket.to(room).emit('leftTask', {...})
+
+  taskController.ts  (REST → WS bridge)
+  ──────────────────────────────────────────────────────────────────
+  const io = getIO();
+  io.to('project-{id}').emit('taskCreated',  task)    ← on POST /tasks
+  io.to('project-{id}').emit('taskUpdated',  task)    ← on PATCH /tasks/:id
+  io.to('project-{id}').emit('taskDeleted',  taskId)  ← on DELETE /tasks/:id
+```
+
+### Room Model
+
+```
+  Socket.io Server
+  │
+  ├── Room: "project-5"  ──────────────────────────────────────────
+  │     Connected sockets:  UserA, UserB, UserC
+  │     Events broadcast here:
+  │       taskCreated  { id, title, status, ... }
+  │       taskUpdated  { id, title, status, ... }
+  │       taskDeleted  taskId
+  │       joinedProject { userId, projectId }
+  │       leftProject   { userId, projectId }
+  │
+  └── Room: "task-42"  ────────────────────────────────────────────
+        Connected sockets:  UserA, UserC    (viewing this task)
+        Events broadcast here:
+          joinedTask  { userId, taskId }
+          leftTask    { userId, taskId }
 ```
 
 ### Room Strategy
@@ -423,31 +659,65 @@ This **singleton pattern** ensures any controller can call `getIO()` without pas
 This is an end-to-end walkthrough of how two users collaborate in real-time:
 
 ```
-User A (Project Owner)          User B (Project Member)
-       │                                │
-       │── POST /users/login ──────────▶│ (Server)
-       │◀── 200 + Access Token ─────────│
-       │                                │
-       │── WS: connect() ──────────────▶│
-       │── WS: emit('joinProject', 1) ─▶│ (joins room: "project-1")
-       │                                │
-       │                   User B logs in and connects
-       │                                │
-       │                                │── WS: connect()
-       │                                │── WS: emit('joinProject', 1)
-       │◀── WS: 'joinedProject' ────────│ (User A gets notified)
-       │                                │
-       │── POST /api/v1/projects/1/tasks
-       │   { title: "Build login UI" } ─▶│ (Server creates task)
-       │◀── 200 + task object ──────────│
-       │                                │
-       │                    ◀── WS: 'taskCreated' + task ──│
-       │                    (User B sees new task instantly) │
-       │                                │
-       │── PATCH /tasks/42             │
-       │   { status: "IN_PROGRESS" } ──▶│
-       │◀── 200 + updated task ─────────│
-       │                    ◀── WS: 'taskUpdated' ──────────│
+  User A (Owner)           API Server            User B (Member)
+  ──────────────           ──────────            ───────────────
+
+  ── LOGIN ─────────────────────────────────────────────────────────────
+
+  POST /users/login ──────► verify creds
+                            generate AT + RT ◄───────────── POST /users/login
+  ◄── 200 AT + cookie ──── respond                ◄─── 200 AT + cookie
+
+
+  ── WEBSOCKET HANDSHAKE ────────────────────────────────────────────────
+
+  ws://localhost:3000 ────► io.on('connection')   ws://localhost:3000 ──►
+                           socket assigned                socket assigned
+                           id: "aaaa"                     id: "bbbb"
+
+  emit('joinProject', 1) ─► socket.join('project-1')
+  ◄── 'joinedProject'                              emit('joinProject', 1) ─►
+  { message: 'you have joined' }                   socket.join('project-1')
+                                    ◄── 'joinedProject' ───────────────────
+  ◄── 'joinedProject'                              { userId:'bbbb', projectId:1 }
+  { userId:'bbbb', projectId:1 }     ← User A notified that B joined
+
+
+  ── CREATE TASK ────────────────────────────────────────────────────────
+
+  POST /projects/1/tasks ─► createTask(1, data)
+  { title: "Design UI" }   io.to('project-1')
+                              .emit('taskCreated', task)
+  ◄── 200 { task } ────────                  ◄── WS: 'taskCreated' ──────
+                                              { id:42, title:'Design UI' }
+                                              User B's UI updates in real-time
+
+
+  ── UPDATE TASK ────────────────────────────────────────────────────────
+
+  PATCH /tasks/42 ────────► updateTask(42, data)
+  { status:'IN_PROGRESS'}   io.to('project-1')
+                              .emit('taskUpdated', task)
+  ◄── 200 { task } ────────                  ◄── WS: 'taskUpdated' ──────
+                                              { id:42, status:'IN_PROGRESS' }
+
+
+  ── DELETE TASK ────────────────────────────────────────────────────────
+
+  DELETE /tasks/42 ───────► deleteTask(42)
+                            io.to('project-1')
+                              .emit('taskDeleted', 42)
+  ◄── 200 { message } ─────                  ◄── WS: 'taskDeleted' ──────
+                                              42   ← remove from UI list
+
+
+  ── LEAVE PROJECT ──────────────────────────────────────────────────────
+
+  emit('leaveProject', 1) ► socket.leave('project-1')
+                            socket.to('project-1')
+                              .emit('leftProject', { userId:'aaaa' })
+                                             ◄── WS: 'leftProject' ──────
+                                             { userId:'aaaa', projectId:1 }
 ```
 
 ---
@@ -751,7 +1021,6 @@ ACCESS_TOKEN_EXPIRES_IN="30m"
 REFRESH_TOKEN_EXPIRES_IN="7d"
 ```
 
-> ⚠️ **Security Warning**: Never commit your `.env` file or real credentials to source control. Rotate `JWT_SECRET` and `DATABASE_URL` credentials immediately if exposed.
 
 | Variable | Required | Description |
 |---|---|---|
@@ -762,189 +1031,10 @@ REFRESH_TOKEN_EXPIRES_IN="7d"
 | `ACCESS_TOKEN_EXPIRES_IN` | Optional | Defaults to `"30m"` in code |
 | `REFRESH_TOKEN_EXPIRES_IN` | Optional | Defaults to `"7d"` in code |
 
----
-
-## 16. Example Requests & Responses
-
-### Register a New User
-
-**Request**
-```http
-POST /api/v1/users/signup
-Content-Type: application/json
-
-{
-  "name": "John Doe",
-  "email": "john@example.com",
-  "password": "secure123"
-}
-```
-
-**Response** `201 Created`
-```json
-{
-  "message": "User created successfully",
-  "user": {
-    "id": 1,
-    "name": "John Doe",
-    "email": "john@example.com",
-    "createdAt": "2026-02-21T20:00:00.000Z"
-  }
-}
-```
-> Access token returned in `Authorization: Bearer <token>` header.
-> Refresh token set as `httpOnly` cookie.
 
 ---
 
-### Login
 
-**Request**
-```http
-POST /api/v1/users/login
-Content-Type: application/json
-
-{
-  "email": "john@example.com",
-  "password": "secure123"
-}
-```
-
-**Response** `200 OK`
-```json
-{
-  "message": "User logged in successfully"
-}
-```
-
----
-
-### Create a Task
-
-**Request**
-```http
-POST /api/v1/projects/1/tasks
-Authorization: Bearer <access-token>
-Content-Type: application/json
-
-{
-  "title": "Design login screen",
-  "description": "Wireframes and final UI for the login page",
-  "createdBy": 1
-}
-```
-
-**Response** `200 OK`
-```json
-{
-  "message": "Task created successfully",
-  "data": {
-    "id": 42,
-    "title": "Design login screen",
-    "description": "Wireframes and final UI for the login page",
-    "status": "PENDING",
-    "projectId": 1,
-    "createdBy": 1,
-    "assigneeId": null,
-    "parentTaskId": null,
-    "createdAt": "2026-02-21T21:00:00.000Z",
-    "updatedAt": "2026-02-21T21:00:00.000Z"
-  }
-}
-```
-> Simultaneously, all clients in room `"project-1"` receive a `taskCreated` WebSocket event.
-
----
-
-### Get Tasks with Filters
-
-**Request**
-```http
-GET /api/v1/projects/1/tasks?status=IN_PROGRESS&page=1&limit=5&sortedBy=createdAt&sortedOrder=desc
-Authorization: Bearer <access-token>
-```
-
-**Response** `200 OK`
-```json
-{
-  "data": {
-    "tasks": [
-      {
-        "id": 42,
-        "title": "Design login screen",
-        "status": "IN_PROGRESS",
-        "assignedTo": { "id": 2, "name": "Jane Smith" },
-        "creator": { "name": "John Doe" },
-        "subTasks": [{ "title": "Create wireframes" }]
-      }
-    ],
-    "pagination": {
-      "total": 1,
-      "totalPages": 1,
-      "currentPage": 1,
-      "hasNextPage": false,
-      "hasPrevPage": false
-    }
-  }
-}
-```
-
----
-
-### Error Response Example
-
-**Request** (invalid token)
-```http
-GET /api/v1/projects/1/tasks
-Authorization: Bearer invalid-token
-```
-
-**Response** `401 Unauthorized`
-```json
-{
-  "message": "Unauthorized"
-}
-```
-
-**Production 500 Error**
-```json
-{
-  "status": "error",
-  "message": "Internal Server Error"
-}
-```
-
----
-
-### Socket.io Connection Example (JavaScript)
-
-```javascript
-import { io } from "socket.io-client";
-
-const socket = io("http://localhost:3000");
-
-// Join the project room to receive real-time task updates
-socket.emit("joinProject", 1);
-
-// Listen for task events
-socket.on("taskCreated", (task) => {
-  console.log("New task added:", task);
-});
-
-socket.on("taskUpdated", (task) => {
-  console.log("Task updated:", task);
-});
-
-socket.on("taskDeleted", (taskId) => {
-  console.log("Task deleted with ID:", taskId);
-});
-
-socket.on("joinedProject", (data) => {
-  console.log("Another user joined:", data);
-});
-```
-
----
 
 ## 17. Developer Notes
 
